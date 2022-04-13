@@ -1,0 +1,534 @@
+---
+title: "Forecasting Flood Inundation"
+author: "Weslene Uy & Hasa Reddy"
+date: "3/17/2022"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    code_folding: hide
+---
+#rm(list=ls())
+# Motivation
+
+Flooding is the most common natural disaster claiming lives, destroying properties, displacing residents, and causing huge financial damages. According to the United Nations' World Meteorological Organization, climate change has accelerated the severity and frequency of storms and floods. With improved forecasting, cities will be better prepared to withstand flooding, and the extent of these damages could be mitigated. Flood inundation models could help identify areas at risk of flooding, which planners could use when developing comprehensive land use and zoning plans, crafting programs to redirect development from areas prone to flooding, preparing local adaptation plans, and projecting different climate scenarios. 
+
+In 2013, Calgary experienced its worst flooding since 1932, leading to $6 billion in damages. We use past flood data from Calgary to develop and test our model's accuracy and apply it to Denver, a metropolis with similar topography and demographics, to check for generalizability. Topography, land cover, and hydrologic data are typically used as inputs to flood prediction models. For this project, we focus on five features which represent these parameters: flow accumulation, NDVI, built-up areas, distance to the nearest streams, and mean elevation. 
+
+```{r setup, include=FALSE}
+
+library(tidyverse)
+library(raster)
+library(sf)
+library(caret)
+library(pscl)
+library(plotROC)
+library(pROC)
+library(sf)
+library(knitr)
+library(kableExtra)
+library(FNN)
+library(scales)
+library(jtools)
+library(viridis)
+library(gridExtra)
+library(ggthemes)
+
+
+mapTheme <- function(base_size = 8, title_size = 12) {
+  theme(
+    text = element_text( color = "black"),
+    plot.title = element_text(size = title_size,colour = "black", face="bold"),
+    plot.subtitle=element_text(size=5),
+    plot.caption=element_text(hjust=0),
+    axis.ticks = element_blank(),
+    panel.background = element_blank(),axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill=NA, size=1),
+    strip.background = element_blank(),
+    strip.text.x = element_text(size = 6.5))
+}
+
+```
+
+# Data
+
+We created a fishnet of 200 by 200 m cells, with the cell size determined by the extent of the city. Using inundation raster data, we calculated the maximum level of flooding for each fishnet cell. The map below shows areas with the highest flood risk. 
+
+```{r data1, include=FALSE}
+
+fishnet1<- st_read("fishnet4.shp")%>%st_as_sf() %>% st_transform('EPSG:3780')
+
+fishnet <- fishnet1 %>% dplyr::select(-(1:2), -(4:6), -(8:11), -(13:15), -(17:20))
+
+calgary<- st_read("CALGIS_CITYBOUND_LIMIT.shp")%>%st_as_sf() %>% st_transform('EPSG:3780')
+
+```
+
+
+```{r inundation}
+
+ggplot() +  
+geom_sf(data=fishnet, aes(fill=as.factor(MAJORITY)), color=NA) + 
+scale_fill_manual(values = c("lightgrey", "#8856a7"), 
+                    labels = c("No","Yes"), 
+                    name = "Inundation") + 
+  labs(title="Inundation in Calgary") + 
+geom_sf(data=calgary, color="white", fill=NA)+ 
+  mapTheme() 
+
+```
+
+## Feature Engineering
+
+For our model, we only included five features: mean elevation, distance to the nearest stream, flow accumulation, NDVI, and a binary variable which indicates whether the fishnet cell is in a built-up area or not.   
+
+### Mean Elevation
+
+Areas with lower elevations have higher flood risks. We calculated the mean elevation for each fishnet cell using Digital Elevation Model(DEM). 
+
+```{r elev}
+
+elevation <- ggplot() +
+  geom_sf(data = fishnet, aes(fill = MEAN), color=NA) +
+  scale_fill_gradient(low ="lightgrey", high="#810f7c")+
+  labs(title = "Mean Elevation", fill="Elevation \n(meters)") + mapTheme()
+
+```
+
+
+### Distance to Nearest Stream
+
+Flooding occurs when rivers or streams overflow its banks. Areas in close proximity to water bodies are more susceptible to flooding. We used the DEM to delineate the stream networks and calculated the distance from the nearest fishnet cell.
+
+```{r stream}
+near_stream <- ggplot() +
+  geom_sf(data = fishnet, aes(fill = NEAR_DIST), color=NA) +
+  scale_fill_gradient(low ="lightgrey", high="#810f7c")+
+  labs(title = "Distance to Nearest Stream", fill="Distance \n(meters)") + mapTheme()
+```
+
+### Maximum Flow Accumulation
+
+Flow accumulation is determined by the number of cells flowing into the downslope output rater cell. 
+
+```{r max flow}
+max_acc <- ggplot()+
+  geom_sf(data = fishnet, aes(fill = MAX), color=NA) +
+  scale_fill_gradient(low ="lightgrey", high="#810f7c",breaks = c(400000, 800000, 1200000), labels = c("400K", "800K", "1200K"))+
+  labs(title = "Maximum Flow Accumulation", fill="Pixels") + mapTheme()
+
+```
+
+### Normalized Difference Vegetation Index (NDVI)
+
+The NDVI is used to measure the vegetation density of an area. Using Landsat8 imagery from USGS, we calculated the NDVI from the near infrared light reflected by the vegetation cover.  
+
+```{r ndvib}
+
+band1 <- raster("band1.tif")
+band2 <- raster("band2.tif")
+band3 <- raster("band3.tif")
+band4 <- raster("band4.tif")
+band5 <- raster("band5.tif")
+band6 <- raster("band6.tif")
+band7 <- raster("band7.tif")
+band8 <- raster("band8.tif")
+band9 <- raster("band9.tif")
+band10 <- raster("band10.tif")
+band11 <- raster("band11.tif")
+
+
+band8 <- aggregate(band8, fact = 2)
+
+
+image <- stack(band1, band2, band3, band4, band5, band6, band7, 
+               band8, band9, band10, band11)
+
+ndvi <- (image[[5]] - image[[4]])/(image[[5]] + image[[4]])
+
+ndvip <-
+  rasterToPoints(ndvi) %>%
+  as.data.frame() %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(ndvi))%>%
+  st_transform(st_crs(calgary))
+```
+
+
+```{r built up, include=FALSE}
+landuse<- st_read("landuse.geojson")%>%st_as_sf() %>% st_transform('EPSG:3780')
+```
+
+
+```{r ndvi, include=FALSE}
+
+ndvi_net<- 
+  ndvip %>% 
+  aggregate(., fishnet, mean)%>% 
+  mutate(layer = ifelse(is.na(layer), mean(na.omit(layer)), layer))
+
+fishnet <- 
+  cbind(fishnet, ndvi_net)
+
+notbuiltup_net <- 
+  landuse %>% 
+  filter(major=="Parks, Recreation and Public Education") %>% 
+  mutate(notbuiltup = 1) %>% 
+  dplyr::select(notbuiltup)%>%
+  st_intersection(., fishnet) %>%
+  dplyr::select(OBJECTID) %>% unique()
+
+fishnet_final <- fishnet %>% mutate(is_park = ifelse(OBJECTID %in% notbuiltup_net$OBJECTID, "park", "no park"))
+
+ndvi_plot <- ggplot()+
+  geom_sf(data = fishnet_final, aes(fill = layer), color=NA) +
+  scale_fill_gradient(low ="lightgrey", high="#810f7c")+
+  labs(title = "NDVI") + mapTheme()
+
+```
+
+### Built-up Area
+
+Built up areas have impervious surfaces which means that water can't seep into the ground. We reclassified Calgary's land use data into a binary variable, where a value of 1 indicates that the fishnet cell is a park and is therefore not in a built-up area. 
+
+```{r land use}
+
+landuseplot <- ggplot()+
+  geom_sf(data = fishnet_final, aes(fill = is_park), color=NA) +
+  scale_fill_manual(values = c("lightgrey", "#810f7c"), 
+                    labels = c("Not built-up","Built-up",
+                               name="Built-up areas"))+  
+labs(title = "Land use") + mapTheme()
+```
+
+
+```{r grid, warning=FALSE}
+grid.arrange(max_acc,near_stream,elevation,ndvi_plot, landuseplot,
+             top = "")
+
+```
+
+## Inundation Outcomes
+
+The plots below show how the variables vary across the flooded or not flooded variable.
+
+```{r warning=FALSE}
+inundationPlotVariables <- 
+  fishnet_final %>% st_drop_geometry()
+
+calgary_fishnet_variables <- inundationPlotVariables %>%
+  dplyr::select(MAJORITY,MAX,MEAN,NEAR_DIST,layer) %>%
+  gather(key, value, MAX:layer)
+
+ggplot(calgary_fishnet_variables, aes(as.factor(MAJORITY), value, fill=as.factor(MAJORITY))) +
+    geom_bar(stat = "identity")+
+    facet_wrap(~key,scales="free") +
+    scale_y_continuous(labels = comma) +
+  scale_fill_manual(values = c("#b3cde3", "#8856a7"),
+                    labels = c("Not Flooded","Flooded"),
+                    name = "") + labs(x="Inundation", y="Value", title= "Variables Used in the Model") + theme_minimal()
+
+```
+
+
+# Model 
+
+We split the data into a 70% training set and a 30% test set. Using a logistic regression model, we specified our dependent variable as `inundation`, which indicates whether flooding occurred in 2013. 
+
+## Model Summary
+
+The output below shows that all five features are statistically significant. 
+
+```{r model}
+set.seed(3456)
+trainIndex <- createDataPartition(fishnet_final$MAJORITY, p = .70,
+                                  list = FALSE,
+                                  times = 1)
+
+calgaryTrain <- fishnet_final[ trainIndex,]
+calgaryTest  <- fishnet_final[-trainIndex,]
+
+model <- glm(MAJORITY ~ ., 
+                    family="binomial"(link="logit"), data = calgaryTrain %>%
+                                                            as.data.frame() %>%
+                                                      dplyr::select(-OBJECTID, -geometry,-geometry.1))
+
+summ(model)
+```
+
+
+## Model Validation
+
+The histogram below shows the frequency of each predicted probability of the test set fishnet cell that flooding will occur. 
+
+```{r hist prob,  include=FALSE, warning=FALSE}
+classProbs <- predict(model, calgaryTest, type="response")
+
+hist((classProbs), main = paste("Histogram of classProbs"), col = "#810f7c", xlab = "Inundation Probability") + theme_minimal()
+```
+
+## Distribution of Probabilities
+
+Meanwhile, the density plots show the distribution of predicted probabilities. Our model is better at predicting `0` or no flooding.
+
+```{r density plot, warning=FALSE}
+testProbs <- data.frame(obs = as.numeric(calgaryTest$MAJORITY),
+                        pred = classProbs)
+                       # ID_FISHNET = calgaryTest$ID_FISHNET)
+
+ggplot(testProbs, aes(x = pred, fill=as.factor(obs))) + 
+  geom_density() +
+  facet_grid(obs ~ .) + 
+  xlab("Probability") + 
+  geom_vline(xintercept = .38) +
+  scale_fill_manual(values = c("#8c96c6", "#810f7c"),
+                      labels = c("Not Flooded","Flooded"),
+                                 name="") +
+                      labs(title = "Distribution of Probabilities") + theme_minimal()
+```
+
+
+## Confusion Matrix
+
+The confusion matrix summarizes the number of correct and incorrect predictions. There are four possible outcomes. With a true positive, the model predicts that inundation occurs when it does. With a true negative, the model predicts that there is no inundation when it doesn't occur. A false positive model predicts that inundation occurs when it doesn't. A false negative model predicts that there is no inundation when it occurs. The count values of each outcome at a 50% threshold is summarized in the table below. The sensitivity, or the true positive rate, is at 24.5%, while the specificity, or the true negative rate, is at 99.8%. The results reveal that the model predicts well for true negatives, which is unsurprising since 95% of the data has this outcome.
+
+```{r confusion matrix}
+testProbs$predClass  = ifelse(testProbs$pred > .5 ,1,0)
+
+caret::confusionMatrix(reference = as.factor(testProbs$obs), 
+                       data = as.factor(testProbs$predClass), 
+                       positive = "1")
+```
+
+## ROC Curve
+
+The ROC curve shows the trade-off between the model's sensitivity and specificity at different thresholds. The Area Under the Curve (AUC) is 0.917, which indicates that our model has a good fit.
+
+```{r roc, warning=FALSE}
+ggplot(testProbs, aes(d = obs, m = pred)) + 
+  geom_roc(n.cuts = 50, labels = FALSE) + 
+  style_roc(theme = theme_grey) +
+  geom_abline(slope = 1, intercept = 0, size = 1.5, color = 'grey')+theme_minimal()
+
+#auc(testProbs$obs, testProbs$pred)
+```
+
+## Cross Validation
+
+To check whether our model generalizes well, we used a k-fold cross validation.  
+
+```{r cv}
+ctrl <- trainControl(method = "cv", 
+                     number = 100, 
+                     savePredictions = TRUE)
+
+cvFit <- train(as.factor(MAJORITY) ~ .,  data = fishnet %>% 
+                                                as.data.frame() %>%                                                dplyr::select(-OBJECTID, -geometry,-geometry.1), 
+               method="glm", family="binomial",
+               trControl = ctrl)
+
+cvFit
+```
+The histogram below plots accuracy across all 100 folds. The accuracy of 95.7% hints at a successful model generalizability. 
+
+```{r accuracy, warning=FALSE}
+ggplot(as.data.frame(cvFit$resample), aes(Accuracy)) + 
+  geom_histogram() +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(x="Accuracy",
+       y="Count")+
+  theme_minimal()
+```
+
+## Mapping Predictions
+
+The map below shows the different confusion matrix outcomes of each fishnet cell in the test data set. There are several cells with false negative outcomes, with the model predicting no inundation when there is flooding.
+```{r}
+test_predictions <- testProbs %>%
+  mutate(TN = predClass==0 & obs==0,
+         TP = predClass==1 & obs==1,
+         FN =  predClass==0 & obs==1,
+         FP = predClass==1 & obs==0)
+
+
+test_predictions <- test_predictions %>%
+  mutate(confResult=case_when(TN == TRUE ~ "True_Negative",
+                              TP == TRUE ~ "True_Positive",
+                              FN == TRUE ~ "False_Negative",
+                              FP == TRUE ~ "False_Positive"))
+
+cal_test_predictions_mapdata <- cbind(calgaryTest, test_predictions, by= "OBJECTID") %>% st_as_sf()
+
+ggplot() + 
+    geom_sf(data=cal_test_predictions_mapdata, aes(fill=confResult), colour=NA)+
+      scale_fill_manual(values = c("Red","Orange","Light Blue","Light Green"),
+                      labels= c("False_Negative","False_Positive","True_Negative","True_Positive"),
+                      name="Outcomes")+
+  labs(title="Confusion Matrix")
+
+```
+
+
+```{r predictions}
+allPredictions <- 
+  predict(cvFit, fishnet_final, type="prob")[,2]
+  
+calgary_fishnet_final_preds <- fishnet_final %>%
+  cbind(fishnet_final,allPredictions) %>%
+  mutate(allPredictions = round(allPredictions * 100)) 
+```
+
+We then mapped the inundation predictions for each fishnet cell. The second map overlays the 2013 flood extent data.
+```{r pred1}
+
+ggplot() + 
+    geom_sf(data=calgary_fishnet_final_preds, aes(fill=allPredictions), colour=NA) +
+  scale_fill_gradient(low ="lightgrey", high="#810f7c")+
+  mapTheme() +
+  labs(title="Predictions for Inundation in Calgary")
+
+```
+
+```{r pred2}
+
+ ggplot() + 
+    geom_sf(data=calgary_fishnet_final_preds, aes(fill=allPredictions), colour=NA) +
+  scale_fill_gradient(low ="lightgrey", high="#810f7c")+
+  geom_sf(data = calgary_fishnet_final_preds %>%
+          filter(MAJORITY =="1"),
+          aes(), color="transparent", fill="red", alpha=0.5)+
+  mapTheme() +
+  labs(title="Predictions for Inundation in Calgary", subtitle = "2013 flood in red")
+
+```
+
+# Comparing to Denver
+
+Finally, we test the model's generalizability. We selected Denver since it has a similar topography and demographics to Calgary. We feature engineered the same variables for Denver. 
+```{r denver, include=FALSE}
+denverfishnet1<- st_read("denverfishnetfinal.shp")%>%st_as_sf() %>% st_transform('EPSG:6428')
+
+denverfishnet <- denverfishnet1 %>% dplyr::select(-(1:3), -(5:6), -(8:11), -(13:15))
+
+denver<- st_read("county_boundary.shp")%>%st_as_sf() %>% st_transform('EPSG:6428')
+
+landusedenver<- st_read("tree_canopy_assessment_2013___land_use.shp")%>%st_as_sf() %>% st_transform('EPSG:6428')
+
+```
+
+
+```{r, warning=FALSE, include=FALSE}
+
+band1denv <- raster("band1denv.tif")
+band2denv <- raster("band2denv.tif")
+band3denv <- raster("band3denv.tif")
+band4denv <- raster("band4denv.tif")
+band5denv <- raster("band5denv.tif")
+band6denv <- raster("band6denv.tif")
+band7denv <- raster("band7denv.tif")
+band8denv <- raster("band8denv.tif")
+band9denv <- raster("band9denv.tif")
+band10denv <- raster("band10denv.tif")
+band11denv <- raster("band11denv.tif")
+
+band8denv_1 <- raster("band8denv_4.tif")
+
+band8denv <- aggregate(band8denv, fact = 2)
+
+imagedenv <- stack(band4denv, band5denv)
+
+ndvidenv <- (imagedenv[[2]] - imagedenv[[1]])/(imagedenv[[2]] + imagedenv[[1]])
+
+ndvipdenv <-
+  rasterToPoints(ndvidenv) %>%
+  as.data.frame() %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(ndvidenv))%>%
+  st_transform(st_crs(denver))
+
+ndvidenv_net<- 
+  ndvipdenv %>% 
+  aggregate(., denverfishnet, mean)%>% 
+  mutate(layer = ifelse(is.na(layer), mean(na.omit(layer)), layer))
+
+denverfishnet <- 
+  cbind(denverfishnet, ndvidenv_net)
+
+notbuiltupdenv_net <- 
+  landusedenver %>% 
+  filter(PROJECT_LU=="Agri" | PROJECT_LU=="OpenSpace") %>% 
+  mutate(notbuiltup = 1) %>% 
+  dplyr::select(notbuiltup)%>%
+  st_intersection(., denverfishnet) %>% 
+  #mutate(notbuiltup = ifelse(is.na(notbuiltup), 0, notbuiltup))
+  dplyr::select(OBJECTID_1) %>% unique()
+
+denverfishnet <- denverfishnet %>% mutate(is_park = ifelse(OBJECTID_1 %in% notbuiltupdenv_net$OBJECTID_1, "park", "no park"))
+
+```
+
+
+```{r map denver}
+elevation_denv<- ggplot() +
+  geom_sf(data = denverfishnet, aes(fill = MEAN), color="transparent") +
+    scale_fill_gradient(low ="lightgrey", high="#810f7c")+
+  labs(title = "Mean Elevation", fill="Elevation \n(meters)") + mapTheme()
+
+near_stream_denv<- ggplot() +
+  geom_sf(data = denverfishnet, aes(fill = NEAR_DIST), color=NA) +
+    scale_fill_gradient(low ="lightgrey", high="#810f7c")+
+  labs(title = "Distance to Nearest Stream", fill="Distance \n(meters)") + mapTheme()
+
+max_acc_denv<- ggplot() +
+  geom_sf(data = denverfishnet, aes(fill = MAX), color=NA) +
+  scale_fill_gradient(low ="lightgrey", high="#810f7c",breaks = c(400000, 800000, 1200000), labels = c("400K", "800K", "1200K"))+
+  labs(title = "Maximum Flow Accumulation", fill="Pixels") + mapTheme()
+
+ndvi_plot_denv <- ggplot()+
+  geom_sf(data = denverfishnet, aes(fill = layer), color=NA) +
+  scale_fill_gradient(low ="lightgrey", high="#810f7c")+
+  labs(title = "NDVI") + mapTheme()
+
+
+landuseplot_denv <- ggplot()+
+  geom_sf(data = denverfishnet, aes(fill = is_park), color=NA) +
+  scale_fill_manual(values = c("lightgrey", "#810f7c"), 
+                    labels = c("Not built-up","Built-up",
+                               name="Built-up areas"))+  
+labs(title = "Land use") + mapTheme()
+
+grid.arrange(max_acc_denv,near_stream_denv,elevation_denv,ndvi_plot_denv, landuseplot_denv,
+             top = "")
+
+```
+
+## Denver prediction
+
+```{r denvpredict, include=FALSE}
+
+denverfishnet <- 
+  denverfishnet %>% mutate (OBJECTID = OBJECTID_1) %>% dplyr::select(-OBJECTID_1)
+
+allPredictionsdenver <- 
+  predict(model, denverfishnet, type="response")
+
+den_fishnet_final_preds <- denverfishnet %>%
+  cbind(denverfishnet, allPredictionsdenver) %>%
+  mutate(allPredictionsdenver = round(allPredictionsdenver*1000000000000)) %>% st_as_sf()
+
+```
+
+
+```{r}
+ggplot() + 
+    geom_sf(data=den_fishnet_final_preds, aes(fill=allPredictionsdenver), colour=NA) +
+  scale_fill_gradient(low ="lightgrey", high="#810f7c")+
+  mapTheme() +
+  labs(title="Predictions for Inundation in Denver")
+```
+
+# Conclusion
+The model made for Calgary to predict flood inundation is not generalisable to predict flooding in Denver, CO. This is could be due to variable reasons such as the variables that were selected might not be significant contributors to predict flooding in Denver. Nevertheless,while the features included in our model are significant predictors of flood risk, other variables such as rainfall quantity, population density, and economic activity near the river basin will improve the model’s predictive power. Despite these limitations, our model could still be a useful starting point for planners to make more informed decisions about flood risks and be better prepared for disasters.
